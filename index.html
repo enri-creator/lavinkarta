@@ -32,6 +32,103 @@
     // Slope steepness (only served by Naturvårdsverket's test GeoServer, as on lavinprognoser.se)
     wms('https://nvgistest.naturvardsverket.se/geoserver', 'lavinprognoser:slope_inclination',
       { opacity: 0.7 }).addTo(map);
+
+    // Distance measurement: click the ruler, then click points on the map
+    const formatDistance = (m) => m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(2)} km`;
+
+    // URL of the elevation proxy (see proxy/README.md); leave empty to show distance only
+    const ELEVATION_URL = 'https://lavinkarta-elevation.enri-bimbashi.workers.dev/';
+    const MAX_SAMPLES = 2000;
+
+    const measure = {
+      active: false,
+      points: [],
+      layer: L.layerGroup().addTo(map),
+      line: null,
+      readout: null,
+      request: 0,
+
+      distance() {
+        return this.points.reduce((sum, p, i) => i ? sum + map.distance(this.points[i - 1], p) : 0, 0);
+      },
+      render() {
+        this.layer.clearLayers();
+        this.points.forEach((p) => L.circleMarker(p, { radius: 4, color: '#d33', fillOpacity: 1 }).addTo(this.layer));
+        L.polyline(this.points, { color: '#d33', weight: 3, dashArray: '6 6' }).addTo(this.layer);
+        this.readout.textContent = this.points.length > 1 ? formatDistance(this.distance()) : 'Klicka på kartan';
+        if (this.points.length > 1 && ELEVATION_URL) this.showElevation(this.readout.textContent);
+      },
+      // Sample the route roughly every 25 m, at most MAX_SAMPLES points
+      samples() {
+        const step = Math.max(25, this.distance() / MAX_SAMPLES);
+        const out = [this.points[0]];
+        for (let i = 1; i < this.points.length; i++) {
+          const a = this.points[i - 1], b = this.points[i];
+          const n = Math.max(1, Math.round(map.distance(a, b) / step));
+          for (let k = 1; k <= n; k++) {
+            out.push(L.latLng(a.lat + (b.lat - a.lat) * k / n, a.lng + (b.lng - a.lng) * k / n));
+          }
+        }
+        return out;
+      },
+      async showElevation(distanceText) {
+        const id = ++this.request;
+        try {
+          const res = await fetch(ELEVATION_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ points: this.samples().map((p) => [+p.lat.toFixed(6), +p.lng.toFixed(6)]) }),
+          });
+          if (!res.ok) throw new Error(res.status);
+          const { heights } = await res.json();
+          if (id !== this.request) return;
+          let gain = 0, loss = 0, prev = null;
+          heights.filter((h) => h !== null).forEach((h) => {
+            if (prev !== null) { if (h > prev) gain += h - prev; else loss += prev - h; }
+            prev = h;
+          });
+          this.readout.textContent = `${distanceText}\n\u2191 ${Math.round(gain)} m  \u2193 ${Math.round(loss)} m`;
+        } catch (err) {
+          if (id === this.request) this.readout.textContent = `${distanceText}\nHöjd ej tillgänglig`;
+        }
+      },
+      toggle(button) {
+        this.active = !this.active;
+        this.points = [];
+        this.request++;
+        this.layer.clearLayers();
+        this.readout.style.display = this.active ? 'block' : 'none';
+        this.readout.textContent = 'Klicka på kartan';
+        button.style.background = this.active ? '#ffd' : '';
+        map.getContainer().style.cursor = this.active ? 'crosshair' : '';
+        this.active ? map.doubleClickZoom.disable() : map.doubleClickZoom.enable();
+      },
+    };
+
+    const MeasureControl = L.Control.extend({
+      options: { position: 'topleft' },
+      onAdd() {
+        const box = L.DomUtil.create('div', 'leaflet-bar');
+        const button = L.DomUtil.create('a', '', box);
+        button.href = '#';
+        button.title = 'Mät avstånd';
+        button.innerHTML = '&#128207;';
+        measure.readout = L.DomUtil.create('div', '', box);
+        Object.assign(measure.readout.style, {
+          display: 'none', background: '#fff', padding: '4px 8px', whiteSpace: 'pre', fontSize: '13px',
+        });
+        L.DomEvent.disableClickPropagation(box);
+        L.DomEvent.on(button, 'click', (e) => { L.DomEvent.preventDefault(e); measure.toggle(button); });
+        return box;
+      },
+    });
+    map.addControl(new MeasureControl());
+
+    map.on('click', (e) => {
+      if (!measure.active) return;
+      measure.points.push(e.latlng);
+      measure.render();
+    });
   </script>
 </body>
 </html>
